@@ -34,6 +34,8 @@ export function Approvals() {
     queryKey: queryKeys.approvals.list(selectedCompanyId!),
     queryFn: () => approvalsApi.list(selectedCompanyId!),
     enabled: !!selectedCompanyId,
+    // Safety net: some approval-creation paths emit no live event, so poll.
+    refetchInterval: 30_000,
   });
 
   const { data: agents } = useQuery({
