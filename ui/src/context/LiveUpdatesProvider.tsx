@@ -1485,6 +1485,11 @@ function invalidateActivityQueries(
     queryClient.invalidateQueries({
       queryKey: queryKeys.approvals.list(companyId),
     });
+    // The dashboard's Pending Approvals metric reads the summary endpoint;
+    // without this it lags behind approval created/resolved events.
+    queryClient.invalidateQueries({
+      queryKey: queryKeys.dashboard(companyId),
+    });
     return;
   }
 

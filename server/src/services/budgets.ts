@@ -475,6 +475,21 @@ export function budgetServiceInTransaction(db: Db, publications: ActivityPublica
         .then((rows) => rows[0] ?? null)
       : null;
 
+    // Emit an approval activity event (post-commit via recordActivity) so live
+    // UI subscribers refresh their pending-approvals views; this path bypasses
+    // the REST route that would otherwise log approval.created.
+    if (approval) {
+      await recordActivity({
+        companyId: policy.companyId,
+        actorType: "system",
+        actorId: "budget_service",
+        action: "approval.created",
+        entityType: "approval",
+        entityId: approval.id,
+        details: { type: approval.type, thresholdType, policyId: policy.id },
+      });
+    }
+
     const incident = await db
       .insert(budgetIncidents)
       .values({

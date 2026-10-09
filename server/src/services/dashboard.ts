@@ -1,4 +1,4 @@
-import { and, eq, gte, lte, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, lte, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { notFound } from "../errors.js";
@@ -50,10 +50,18 @@ export function dashboardService(db: Db) {
         .where(and(eq(issues.companyId, companyId), executionIssueCondition()))
         .groupBy(issues.status));
 
+      // Mirror the Approvals page: revision_requested still awaits a board
+      // decision. Budget approvals are excluded because the UI metric adds
+      // budgets.pendingApprovals (open incidents with a pending approval) on
+      // top — counting budget_override_required here would double them.
       const pendingApprovals = await retryIdempotentDatabaseOperation(() => db
         .select({ count: sql<number>`count(*)` })
         .from(approvals)
-        .where(and(eq(approvals.companyId, companyId), eq(approvals.status, "pending")))
+        .where(and(
+          eq(approvals.companyId, companyId),
+          inArray(approvals.status, ["pending", "revision_requested"]),
+          notInArray(approvals.type, ["budget_override_required"]),
+        ))
         .then((rows) => Number(rows[0]?.count ?? 0)));
 
       const agentCounts: Record<string, number> = {

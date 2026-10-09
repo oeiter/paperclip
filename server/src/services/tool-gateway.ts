@@ -2487,6 +2487,26 @@ export function createToolGatewayService(
           linkedByAgentId: input.session.agentId,
         })
         .onConflictDoNothing();
+      // Emit an approval activity event so live UI subscribers refresh their
+      // pending-approvals views; this path bypasses the REST route that would
+      // otherwise log approval.created.
+      await logActivity(db, {
+        companyId: input.session.companyId,
+        actorType: input.session.agentId ? "agent" : "system",
+        actorId: input.session.agentId ?? "tool-gateway",
+        agentId: input.session.agentId,
+        runId: input.session.runId,
+        issueId: input.session.issueId,
+        action: "approval.created",
+        entityType: "approval",
+        entityId: approval.id,
+        details: {
+          type: approval.type,
+          source: "tool_gateway",
+          tool: input.tool.name,
+          actionRequestId: actionRequest.id,
+        },
+      });
     }
 
     const interaction = await interactions.create(

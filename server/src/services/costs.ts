@@ -1,5 +1,5 @@
 import { receiptFingerprint } from "./receipt-fingerprint.js";
-import { agentAvatarUrl, resolveAgentAppearance, createCostEventSchema, createServiceCostEventSchema, normalizeCents, type MoneyInput, type CostByUserReport } from "@paperclipai/shared";
+import { agentAvatarUrl, resolveAgentAppearance, createCostEventSchema, createServiceCostEventSchema, centsToUnits, normalizeCents, unitsToCents, type MoneyInput, type CostByUserReport } from "@paperclipai/shared";
 import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
@@ -82,6 +82,65 @@ export async function getMonthlySpendTotal(
   return Number(row?.total ?? 0);
 }
 
+/** Rates (cents per million tokens) for the default zero-cost estimate. */
+function estimateRateCentsPerMillion(name: string, fallbackCents: string): string {
+  const raw = process.env[name]?.trim();
+  if (raw && Number.isFinite(Number(raw)) && Number(raw) >= 0) return raw;
+  return fallbackCents;
+}
+
+// Subscription usage arrives with cost 0 (no per-token billing behind the
+// gateway), but budgets sum billed cents. Estimate the cost from token counts
+// using configurable default rates, mark it as estimated, and never overwrite
+// what was actually reported (reported_cost_cents keeps the original value so
+// accounting integrity keeps reconciling against the reported receipt).
+function applyDefaultZeroCostEstimate(values: {
+  costCents: string;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  billingType: string;
+  costStatus: string;
+  pricingProvenance?:
+    | {
+        source: "provider_reported" | "provider_invoice" | "operator" | "rate_card" | "unknown";
+        version?: string;
+        evidence?: string;
+        inputCentsPerMillion?: string;
+        cachedInputCentsPerMillion?: string;
+        outputCentsPerMillion?: string;
+        cacheWriteCentsPerMillion?: string;
+        serviceTier?: string;
+        contextTier?: "short" | "long";
+      }
+    | null
+    | undefined;
+}) {
+  if (values.costCents !== "0.0000000") return;
+  if (values.inputTokens <= 0 && values.cachedInputTokens <= 0 && values.outputTokens <= 0) return;
+  if (values.billingType !== "subscription_included" && values.billingType !== "unknown") return;
+  if (values.costStatus !== "reported") return;
+  const inputRate = estimateRateCentsPerMillion("PAPERCLIP_COST_ESTIMATE_INPUT_CENTS_PER_MTOK", "50");
+  const cachedRate = estimateRateCentsPerMillion("PAPERCLIP_COST_ESTIMATE_CACHE_READ_CENTS_PER_MTOK", "5");
+  const outputRate = estimateRateCentsPerMillion("PAPERCLIP_COST_ESTIMATE_OUTPUT_CENTS_PER_MTOK", "200");
+  const weighted = centsToUnits(inputRate) * BigInt(values.inputTokens)
+    + centsToUnits(cachedRate) * BigInt(values.cachedInputTokens)
+    + centsToUnits(outputRate) * BigInt(values.outputTokens);
+  // Token counts are per million; round to whole money units, half up.
+  const units = (weighted + 500_000n) / 1_000_000n;
+  if (units <= 0n) return;
+  values.costCents = unitsToCents(units);
+  values.costStatus = "estimated";
+  values.pricingProvenance = {
+    source: "rate_card",
+    version: "default-estimate/v1",
+    evidence: "Default token-based estimate for unpriced subscription usage (PAPERCLIP_COST_ESTIMATE_*_CENTS_PER_MTOK)",
+    inputCentsPerMillion: normalizeCents(inputRate),
+    cachedInputCentsPerMillion: normalizeCents(cachedRate),
+    outputCentsPerMillion: normalizeCents(outputRate),
+  };
+}
+
 export async function createCostEventInTransaction(db: Db, companyId: string, data: Omit<typeof costEvents.$inferInsert, "companyId" | "receiptHash" | "costCents"> & { costCents: MoneyInput }, publications: ActivityPublication[] = [], actor?: Pick<LogActivityInput, "actorType" | "actorId" | "agentId">) {
   const parsed = (data.usageKind === "decision" ? createServiceCostEventSchema : createCostEventSchema).safeParse({ ...data, occurredAt: data.occurredAt.toISOString() });
   if (!parsed.success) throw unprocessable("Invalid cost receipt", parsed.error.flatten());
@@ -103,6 +162,10 @@ export async function createCostEventInTransaction(db: Db, companyId: string, da
   try {
     if (normalizeCents(Number(values.costCents)) === values.costCents) legacyHash = receiptFingerprint({ ...values, costCents: Number(values.costCents) });
   } catch { /* The legacy number may round beyond the decimal storage limit. */ }
+  // The estimate is applied after hashing: the receipt identity is keyed on
+  // what was reported, so changing the estimate rates never breaks replays.
+  const reportedCostCents = values.costCents;
+  applyDefaultZeroCostEstimate(values);
   if (values.idempotencyKey) {
     const [existing] = await db.select().from(costEvents).where(and(
       eq(costEvents.companyId, companyId), eq(costEvents.idempotencyKey, values.idempotencyKey),
@@ -128,7 +191,7 @@ export async function createCostEventInTransaction(db: Db, companyId: string, da
     const [run] = await db.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(eq(heartbeatRuns.id, values.heartbeatRunId));
     if (run.agentId !== values.agentId) throw unprocessable("Heartbeat run does not belong to agent");
   }
-  const [event] = await db.insert(costEvents).values({ ...values, costCents: sql`${values.costCents}::numeric`, reportedCostCents: values.costCents, id: data.id, companyId, receiptHash }).returning();
+  const [event] = await db.insert(costEvents).values({ ...values, costCents: sql`${values.costCents}::numeric`, reportedCostCents, id: data.id, companyId, receiptHash }).returning();
   await updateMonthlySpendProjections(db, companyId, event.agentId, values.costCents, event.occurredAt);
   // Separately reported charges linked to an already-accounted run contribute
   // to lifetime totals too. Before acknowledgement, accountRunCost includes
